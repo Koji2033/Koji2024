@@ -1,5 +1,4 @@
 import datetime as dt
-import math
 
 import numpy as np
 import pandas as pd
@@ -10,30 +9,30 @@ import yfinance as yf
 
 
 st.set_page_config(
-    page_title="株価チャート・売買シミュレーター",
+    page_title="株価チャート・手動売買シミュレーター",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 
+# -----------------------------
+# Price data
+# -----------------------------
 def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """yfinanceの返却形式差を吸収し、OHLCVを単一列に整える。"""
+    """Normalize yfinance return formats to a single OHLCV table."""
     if df is None or df.empty:
         return pd.DataFrame()
 
     out = df.copy()
 
-    # yfinanceがMultiIndexを返すケースに対応
     if isinstance(out.columns, pd.MultiIndex):
-        # 典型例: level 0 = Price, level 1 = Ticker
         if ticker in out.columns.get_level_values(-1):
             try:
                 out = out.xs(ticker, axis=1, level=-1)
             except Exception:
                 pass
         if isinstance(out.columns, pd.MultiIndex):
-            # 残った階層から OHLCV を含む側を優先
             for level in range(out.columns.nlevels):
                 vals = set(map(str, out.columns.get_level_values(level)))
                 if {"Open", "High", "Low", "Close"}.issubset(vals):
@@ -44,30 +43,64 @@ def normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     keep = [c for c in wanted if c in out.columns]
     out = out[keep].copy()
 
-    for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+    for c in wanted:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
     out.index = pd.to_datetime(out.index).tz_localize(None)
     out = out[~out.index.duplicated(keep="last")].sort_index()
     out = out.dropna(subset=["Open", "High", "Low", "Close"])
+    if "Volume" not in out.columns:
+        out["Volume"] = 0
     return out
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_prices(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
-    """Yahoo Finance経由で価格データを取得。endはyfinance仕様上exclusiveなので1日加算。"""
-    end_exclusive = end + dt.timedelta(days=1)
+    """Download daily prices. yfinance end date is exclusive."""
     raw = yf.download(
         ticker,
         start=start.isoformat(),
-        end=end_exclusive.isoformat(),
+        end=(end + dt.timedelta(days=1)).isoformat(),
         auto_adjust=False,
         progress=False,
         actions=False,
         threads=False,
     )
     return normalize_ohlcv(raw, ticker)
+
+
+def aggregate_prices(daily: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    Aggregate only rows already visible to the user.
+    Weekly/monthly labels use the last actual visible trading day.
+    """
+    if daily.empty or timeframe == "日足":
+        return daily.copy()
+
+    work = daily.copy()
+    if timeframe == "週足":
+        groups = work.index.to_period("W-FRI")
+    else:
+        groups = work.index.to_period("M")
+
+    records = []
+    dates = []
+    for _, g in work.groupby(groups):
+        if g.empty:
+            continue
+        records.append(
+            {
+                "Open": float(g["Open"].iloc[0]),
+                "High": float(g["High"].max()),
+                "Low": float(g["Low"].min()),
+                "Close": float(g["Close"].iloc[-1]),
+                "Volume": float(g["Volume"].sum()),
+            }
+        )
+        dates.append(g.index[-1])
+
+    return pd.DataFrame(records, index=pd.DatetimeIndex(dates))
 
 
 def add_indicators(df: pd.DataFrame, sma_list: list[int]) -> pd.DataFrame:
@@ -78,27 +111,31 @@ def add_indicators(df: pd.DataFrame, sma_list: list[int]) -> pd.DataFrame:
     delta = out["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    out["RSI14"] = 100 - (100 / (1 + rs))
-    out["RSI14"] = out["RSI14"].fillna(100).clip(0, 100)
+    out["RSI14"] = (100 - (100 / (1 + rs))).clip(0, 100)
     return out
 
 
-def stock_chart(df: pd.DataFrame, ticker: str, sma_list: list[int]) -> go.Figure:
-    rows = 3
+def stock_chart(df: pd.DataFrame, ticker: str, timeframe: str, sma_list: list[int]) -> go.Figure:
+    """
+    A category x-axis intentionally removes weekend/holiday gaps.
+    Each candle occupies one equal horizontal step.
+    """
     fig = make_subplots(
-        rows=rows,
+        rows=3,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.03,
         row_heights=[0.68, 0.18, 0.14],
     )
 
+    x = [d.strftime("%Y-%m-%d") for d in df.index]
+
     fig.add_trace(
         go.Candlestick(
-            x=df.index,
+            x=x,
             open=df["Open"],
             high=df["High"],
             low=df["Low"],
@@ -113,19 +150,14 @@ def stock_chart(df: pd.DataFrame, ticker: str, sma_list: list[int]) -> go.Figure
         col = f"SMA{n}"
         if col in df.columns:
             fig.add_trace(
-                go.Scatter(x=df.index, y=df[col], mode="lines", name=f"SMA {n}"),
+                go.Scatter(x=x, y=df[col], mode="lines", name=f"SMA {n}"),
                 row=1,
                 col=1,
             )
 
+    fig.add_trace(go.Bar(x=x, y=df["Volume"], name="出来高"), row=2, col=1)
     fig.add_trace(
-        go.Bar(x=df.index, y=df["Volume"], name="出来高"),
-        row=2,
-        col=1,
-    )
-
-    fig.add_trace(
-        go.Scatter(x=df.index, y=df["RSI14"], mode="lines", name="RSI 14"),
+        go.Scatter(x=x, y=df["RSI14"], mode="lines", name="RSI 14"),
         row=3,
         col=1,
     )
@@ -133,195 +165,270 @@ def stock_chart(df: pd.DataFrame, ticker: str, sma_list: list[int]) -> go.Figure
     fig.add_hline(y=30, line_dash="dot", row=3, col=1)
 
     fig.update_layout(
-        title=f"{ticker} 株価チャート",
+        title=f"{ticker} {timeframe}チャート",
         height=760,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
         legend=dict(orientation="h"),
         margin=dict(l=30, r=20, t=60, b=20),
     )
+    for row in (1, 2, 3):
+        fig.update_xaxes(type="category", row=row, col=1)
+
+    if len(x) > 0:
+        step = max(1, len(x) // 12)
+        tickvals = x[::step]
+        ticktext = [
+            pd.Timestamp(v).strftime("%Y/%m/%d" if timeframe == "日足" else "%Y/%m")
+            for v in tickvals
+        ]
+        fig.update_xaxes(tickmode="array", tickvals=tickvals, ticktext=ticktext, row=3, col=1)
+
     fig.update_yaxes(title_text="価格", row=1, col=1)
     fig.update_yaxes(title_text="出来高", row=2, col=1)
     fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
     return fig
 
 
-def backtest_ma(
-    df: pd.DataFrame,
-    initial_cash: float,
-    short_n: int,
-    long_n: int,
-    commission_pct: float,
-    slippage_pct: float,
-):
-    """
-    MAクロス:
-      - t日の終値まででクロスを判定
-      - t+1日の始値で約定
-      - 現物・全額売買、空売りなし
-    """
-    d = df.copy()
-    d["short_ma"] = d["Close"].rolling(short_n).mean()
-    d["long_ma"] = d["Close"].rolling(long_n).mean()
-    d["signal"] = (d["short_ma"] > d["long_ma"]).astype(int)
-
-    # 当日終値シグナルを翌営業日の始値で執行
-    d["exec_signal"] = d["signal"].shift(1).fillna(0).astype(int)
-
-    cash = float(initial_cash)
-    shares = 0
-    equity = []
-    trades = []
-    entry_total_cost = None
-    entry_date = None
-    entry_price = None
-
-    commission_rate = commission_pct / 100.0
-    slip_rate = slippage_pct / 100.0
-
-    prev_exec_signal = 0
-
-    for date, row in d.iterrows():
-        target = int(row["exec_signal"])
-        open_px = float(row["Open"])
-        close_px = float(row["Close"])
-
-        if target == 1 and prev_exec_signal == 0 and shares == 0:
-            buy_px = open_px * (1 + slip_rate)
-            per_share_cost = buy_px * (1 + commission_rate)
-            qty = math.floor(cash / per_share_cost) if per_share_cost > 0 else 0
-
-            if qty > 0:
-                gross = qty * buy_px
-                fee = gross * commission_rate
-                total = gross + fee
-                cash -= total
-                shares = qty
-                entry_total_cost = total
-                entry_date = date
-                entry_price = buy_px
-                trades.append(
-                    {
-                        "日付": date.date().isoformat(),
-                        "売買": "買",
-                        "株数": qty,
-                        "約定価格": round(buy_px, 4),
-                        "手数料": round(fee, 2),
-                        "実現損益": np.nan,
-                    }
-                )
-
-        elif target == 0 and prev_exec_signal == 1 and shares > 0:
-            sell_px = open_px * (1 - slip_rate)
-            gross = shares * sell_px
-            fee = gross * commission_rate
-            proceeds = gross - fee
-            cash += proceeds
-            pnl = proceeds - (entry_total_cost or 0)
-
-            trades.append(
-                {
-                    "日付": date.date().isoformat(),
-                    "売買": "売",
-                    "株数": shares,
-                    "約定価格": round(sell_px, 4),
-                    "手数料": round(fee, 2),
-                    "実現損益": round(pnl, 2),
-                }
-            )
-            shares = 0
-            entry_total_cost = None
-            entry_date = None
-            entry_price = None
-
-        market_value = shares * close_px
-        equity.append(cash + market_value)
-        prev_exec_signal = target
-
-    d["Equity"] = equity
-
-    final_equity = float(d["Equity"].iloc[-1]) if not d.empty else initial_cash
-    total_return = (final_equity / initial_cash - 1) * 100 if initial_cash else np.nan
-
-    # Buy & Hold比較: 初日終値→最終日終値（単純価格リターン）
-    benchmark = (d["Close"].iloc[-1] / d["Close"].iloc[0] - 1) * 100 if len(d) >= 2 else np.nan
-
-    peak = d["Equity"].cummax()
-    drawdown = d["Equity"] / peak - 1
-    max_dd = float(drawdown.min() * 100) if len(drawdown) else np.nan
-
-    trade_df = pd.DataFrame(trades)
-    sell_rows = trade_df[trade_df["売買"] == "売"] if not trade_df.empty else pd.DataFrame()
-    wins = int((sell_rows["実現損益"] > 0).sum()) if not sell_rows.empty else 0
-    closed = len(sell_rows)
-    win_rate = wins / closed * 100 if closed else np.nan
-
-    metrics = {
-        "final_equity": final_equity,
-        "total_return": total_return,
-        "benchmark": benchmark,
-        "max_drawdown": max_dd,
-        "closed_trades": closed,
-        "win_rate": win_rate,
-        "open_position": shares,
-    }
-    return d, trade_df, metrics
-
-
-def manual_trade_sim(
-    df: pd.DataFrame,
-    buy_date,
-    sell_date,
-    shares: int,
-    commission_pct: float,
-    slippage_pct: float,
-):
-    if buy_date >= sell_date:
-        raise ValueError("売却日は購入日より後の日付を選んでください。")
-    if shares <= 0:
-        raise ValueError("株数は1以上にしてください。")
-
-    idx = df.index
-    buy_candidates = idx[idx.date >= buy_date]
-    sell_candidates = idx[idx.date >= sell_date]
-    if len(buy_candidates) == 0 or len(sell_candidates) == 0:
-        raise ValueError("指定日以降の取引日が価格データ内にありません。")
-
-    bd = buy_candidates[0]
-    sd = sell_candidates[0]
-    if bd >= sd:
-        raise ValueError("実際の取引日ベースで売却日が購入日より後になるよう設定してください。")
-
-    fee_rate = commission_pct / 100.0
-    slip_rate = slippage_pct / 100.0
-    buy_px = float(df.loc[bd, "Open"]) * (1 + slip_rate)
-    sell_px = float(df.loc[sd, "Open"]) * (1 - slip_rate)
-
-    buy_gross = buy_px * shares
-    buy_fee = buy_gross * fee_rate
-    sell_gross = sell_px * shares
-    sell_fee = sell_gross * fee_rate
-    invested = buy_gross + buy_fee
-    proceeds = sell_gross - sell_fee
-    pnl = proceeds - invested
-    ret = pnl / invested * 100 if invested else np.nan
-
+# -----------------------------
+# Manual trading simulator
+# -----------------------------
+def empty_sim_state() -> dict:
     return {
-        "購入取引日": bd.date().isoformat(),
-        "売却取引日": sd.date().isoformat(),
-        "購入約定価格": buy_px,
-        "売却約定価格": sell_px,
-        "購入総額": invested,
-        "売却受取額": proceeds,
-        "損益": pnl,
-        "収益率": ret,
+        "active": False,
+        "ticker": None,
+        "current_idx": None,
+        "start_idx": None,
+        "initial_cash": 1_000_000.0,
+        "cash": 1_000_000.0,
+        "spot_qty": 0,
+        "spot_avg": 0.0,
+        "margin_long_qty": 0,
+        "margin_long_avg": 0.0,
+        "margin_short_qty": 0,
+        "margin_short_avg": 0.0,
+        "realized_pnl": 0.0,
+        "pending_order": None,
+        "order_log": [],
+        "trade_log": [],
     }
 
 
-st.title("📈 株価チャート・売買シミュレーター")
-st.caption(
-    "価格データ取得: Yahoo Finance（yfinance）。教育・検証用です。実売買注文は行いません。"
-)
+if "sim" not in st.session_state:
+    st.session_state.sim = empty_sim_state()
+if "chart_cursor" not in st.session_state:
+    st.session_state.chart_cursor = None
+if "chart_cursor_signature" not in st.session_state:
+    st.session_state.chart_cursor_signature = None
+
+
+def weighted_average(old_qty: int, old_avg: float, add_qty: int, add_price: float) -> float:
+    total_qty = old_qty + add_qty
+    if total_qty <= 0:
+        return 0.0
+    return (old_qty * old_avg + add_qty * add_price) / total_qty
+
+
+def fill_price_for_order(order: dict, row: pd.Series) -> tuple[bool, float | None, str]:
+    """Determine next-day execution using only that day's OHLC."""
+    side = order["side"]
+    method = order["method"]
+    slip = float(order["slippage_pct"]) / 100.0
+
+    open_px = float(row["Open"])
+    high_px = float(row["High"])
+    low_px = float(row["Low"])
+    close_px = float(row["Close"])
+
+    if method == "寄り成り":
+        px = open_px * (1 + slip if side == "買い" else 1 - slip)
+        return True, px, "寄り成り"
+
+    if method == "引け成り":
+        px = close_px * (1 + slip if side == "買い" else 1 - slip)
+        return True, px, "引け成り"
+
+    limit_px = float(order["limit_price"])
+    if side == "買い":
+        if open_px <= limit_px:
+            return True, open_px, "指値（寄付で有利約定）"
+        if low_px <= limit_px:
+            return True, limit_px, "指値"
+        return False, None, "指値に届かず失効"
+
+    if open_px >= limit_px:
+        return True, open_px, "指値（寄付で有利約定）"
+    if high_px >= limit_px:
+        return True, limit_px, "指値"
+    return False, None, "指値に届かず失効"
+
+
+def apply_spot_trade(sim: dict, side: str, qty: int, price: float, fee: float) -> tuple[bool, str]:
+    if side == "買い":
+        total = price * qty + fee
+        if sim["cash"] + 1e-9 < total:
+            return False, "現金不足のため約定できませんでした。"
+        sim["cash"] -= total
+        sim["realized_pnl"] -= fee
+        sim["spot_avg"] = weighted_average(sim["spot_qty"], sim["spot_avg"], qty, price)
+        sim["spot_qty"] += qty
+        return True, "現物買い"
+
+    if sim["spot_qty"] < qty:
+        return False, "現物保有株数を超える売却のため約定できませんでした。"
+
+    gross = price * qty
+    sim["cash"] += gross - fee
+    sim["realized_pnl"] += (price - sim["spot_avg"]) * qty - fee
+    sim["spot_qty"] -= qty
+    if sim["spot_qty"] == 0:
+        sim["spot_avg"] = 0.0
+    return True, "現物売り"
+
+
+def apply_margin_trade(sim: dict, side: str, qty: int, price: float, fee: float) -> tuple[bool, str]:
+    """
+    Simplified margin accounting:
+    opposite orders close existing opposite positions first, then excess opens a new position.
+    No margin requirement, interest, stock-loan fee, or forced liquidation.
+    """
+    remaining = qty
+    actions = []
+    fee_per_share = fee / qty if qty else 0.0
+
+    if side == "買い":
+        close_qty = min(remaining, sim["margin_short_qty"])
+        if close_qty > 0:
+            allocated_fee = fee_per_share * close_qty
+            pnl = (sim["margin_short_avg"] - price) * close_qty - allocated_fee
+            sim["cash"] += pnl
+            sim["realized_pnl"] += pnl
+            sim["margin_short_qty"] -= close_qty
+            if sim["margin_short_qty"] == 0:
+                sim["margin_short_avg"] = 0.0
+            remaining -= close_qty
+            actions.append(f"信用売り返済 {close_qty}株")
+
+        if remaining > 0:
+            allocated_fee = fee_per_share * remaining
+            sim["cash"] -= allocated_fee
+            sim["realized_pnl"] -= allocated_fee
+            sim["margin_long_avg"] = weighted_average(
+                sim["margin_long_qty"], sim["margin_long_avg"], remaining, price
+            )
+            sim["margin_long_qty"] += remaining
+            actions.append(f"信用買い新規 {remaining}株")
+
+    else:
+        close_qty = min(remaining, sim["margin_long_qty"])
+        if close_qty > 0:
+            allocated_fee = fee_per_share * close_qty
+            pnl = (price - sim["margin_long_avg"]) * close_qty - allocated_fee
+            sim["cash"] += pnl
+            sim["realized_pnl"] += pnl
+            sim["margin_long_qty"] -= close_qty
+            if sim["margin_long_qty"] == 0:
+                sim["margin_long_avg"] = 0.0
+            remaining -= close_qty
+            actions.append(f"信用買い返済 {close_qty}株")
+
+        if remaining > 0:
+            allocated_fee = fee_per_share * remaining
+            sim["cash"] -= allocated_fee
+            sim["realized_pnl"] -= allocated_fee
+            sim["margin_short_avg"] = weighted_average(
+                sim["margin_short_qty"], sim["margin_short_avg"], remaining, price
+            )
+            sim["margin_short_qty"] += remaining
+            actions.append(f"信用売り新規 {remaining}株")
+
+    return True, " / ".join(actions)
+
+
+def process_pending_order(sim: dict, execution_date: pd.Timestamp, row: pd.Series) -> None:
+    order = sim.get("pending_order")
+    if not order:
+        return
+
+    filled, price, reason = fill_price_for_order(order, row)
+    log_base = {
+        "注文日": order["order_date"],
+        "執行日": execution_date.date().isoformat(),
+        "区分": order["account_type"],
+        "売買": order["side"],
+        "株数": order["qty"],
+        "方法": order["method"],
+        "指値": order.get("limit_price"),
+    }
+
+    if not filled or price is None:
+        sim["order_log"].append(
+            {**log_base, "状態": "失効", "約定価格": np.nan, "備考": reason}
+        )
+        sim["pending_order"] = None
+        return
+
+    fee_rate = float(order["commission_pct"]) / 100.0
+    fee = float(price) * int(order["qty"]) * fee_rate
+
+    if order["account_type"] == "現物":
+        ok, action = apply_spot_trade(
+            sim, order["side"], int(order["qty"]), float(price), fee
+        )
+    else:
+        ok, action = apply_margin_trade(
+            sim, order["side"], int(order["qty"]), float(price), fee
+        )
+
+    if ok:
+        sim["order_log"].append(
+            {
+                **log_base,
+                "状態": "約定",
+                "約定価格": round(float(price), 4),
+                "備考": f"{reason} / {action}",
+            }
+        )
+        sim["trade_log"].append(
+            {
+                "日付": execution_date.date().isoformat(),
+                "区分": order["account_type"],
+                "内容": action,
+                "株数": int(order["qty"]),
+                "約定価格": round(float(price), 4),
+                "手数料": round(fee, 2),
+                "確定損益累計": round(sim["realized_pnl"], 2),
+            }
+        )
+    else:
+        sim["order_log"].append(
+            {
+                **log_base,
+                "状態": "取消",
+                "約定価格": np.nan,
+                "備考": action,
+            }
+        )
+
+    sim["pending_order"] = None
+
+
+def unrealized_pnl(sim: dict, close_px: float) -> tuple[float, float, float, float]:
+    spot = (close_px - sim["spot_avg"]) * sim["spot_qty"]
+    mlong = (close_px - sim["margin_long_avg"]) * sim["margin_long_qty"]
+    mshort = (sim["margin_short_avg"] - close_px) * sim["margin_short_qty"]
+    return spot, mlong, mshort, spot + mlong + mshort
+
+
+def fmt_price(v: float) -> str:
+    return f"{v:,.2f}"
+
+
+# -----------------------------
+# Sidebar / load data
+# -----------------------------
+st.title("📈 株価チャート・手動売買シミュレーター")
+st.caption("価格データ: Yahoo Finance（yfinance）。実注文は行わない学習・検証用アプリです。")
 
 with st.sidebar:
     st.header("基本設定")
@@ -332,9 +439,11 @@ with st.sidebar:
     ).strip().upper()
 
     today = dt.date.today()
-    default_start = today - dt.timedelta(days=365 * 2)
-    start = st.date_input("開始日", value=default_start)
-    end = st.date_input("終了日", value=today)
+    default_start = today - dt.timedelta(days=365 * 3)
+    start = st.date_input("データ開始日", value=default_start)
+    end = st.date_input("データ終了日", value=today)
+
+    timeframe = st.radio("足種", ["日足", "週足", "月足"], horizontal=True)
 
     st.subheader("チャート")
     sma_list = st.multiselect(
@@ -353,23 +462,24 @@ with st.sidebar:
         format="%.3f",
     )
     slippage_pct = st.number_input(
-        "スリッページ (%)",
+        "成行スリッページ (%)",
         min_value=0.0,
         max_value=10.0,
         value=0.05,
         step=0.01,
         format="%.3f",
+        help="寄り成り・引け成りに適用。指値では価格改善ルールを優先します。",
     )
 
-    reload_button = st.button("価格データを再取得", use_container_width=True)
-    if reload_button:
+    if st.button("価格データを再取得", use_container_width=True):
         load_prices.clear()
+        st.rerun()
 
 if not ticker:
     st.warning("銘柄コードを入力してください。")
     st.stop()
 if start >= end:
-    st.error("終了日は開始日より後にしてください。")
+    st.error("データ終了日は開始日より後にしてください。")
     st.stop()
 
 with st.spinner("価格データを取得しています…"):
@@ -380,203 +490,315 @@ with st.spinner("価格データを取得しています…"):
         st.stop()
 
 if prices.empty:
-    st.error(
-        "価格データを取得できませんでした。銘柄コード・期間を確認してください。"
-        " 日本株は通常「7203.T」のように .T を付けます。"
-    )
+    st.error("価格データを取得できませんでした。銘柄コード・期間を確認してください。")
     st.stop()
 
-data = add_indicators(prices, sma_list)
+sim = st.session_state.sim
+if sim["active"] and sim["ticker"] != ticker:
+    st.session_state.sim = empty_sim_state()
+    sim = st.session_state.sim
+    st.warning("銘柄コードが変更されたため、手動売買シミュレーションを終了しました。")
 
-latest = data.iloc[-1]
-prev = data.iloc[-2] if len(data) >= 2 else latest
-delta = latest["Close"] - prev["Close"]
-delta_pct = delta / prev["Close"] * 100 if prev["Close"] else 0
+# While a simulation is active, the cutoff applies to the entire app.
+if sim["active"]:
+    sim_idx = min(int(sim["current_idx"]), len(prices) - 1)
+    visible_daily = prices.iloc[: sim_idx + 1].copy()
+    cutoff_date = visible_daily.index[-1]
+else:
+    visible_daily = prices.copy()
+    cutoff_date = visible_daily.index[-1]
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("終値", f"{latest['Close']:,.2f}", f"{delta:+,.2f}")
-m2.metric("前日比", f"{delta_pct:+.2f}%")
-m3.metric("出来高", f"{latest['Volume']:,.0f}")
-m4.metric("RSI(14)", f"{latest['RSI14']:.1f}")
+display_bars = add_indicators(aggregate_prices(visible_daily, timeframe), sma_list)
 
-tab1, tab2, tab3 = st.tabs(["チャート", "自動売買バックテスト", "手動売買シミュレーション"])
+tab_chart, tab_sim = st.tabs(["チャート", "手動売買シミュレーション"])
 
-with tab1:
-    fig = stock_chart(data, ticker, sma_list)
-    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
-
-    with st.expander("価格データ"):
-        view = data.reset_index().rename(columns={"index": "Date"})
-        st.dataframe(view.tail(250), use_container_width=True, hide_index=True)
-        st.download_button(
-            "価格データCSVをダウンロード",
-            data=view.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{ticker}_prices.csv",
-            mime="text/csv",
+with tab_chart:
+    if sim["active"]:
+        st.info(
+            f"シミュレーション中: {cutoff_date.date().isoformat()} までのデータだけ表示しています。"
+            " 未来の価格データは非表示です。"
         )
 
-with tab2:
-    st.subheader("移動平均クロス戦略")
-    st.write(
-        "短期移動平均が長期移動平均を上抜けたら買い、下抜けたら売り。"
-        " シグナルは終値で判定し、翌取引日の始値で約定します。"
-    )
+    signature = (ticker, timeframe, cutoff_date.date().isoformat(), len(display_bars))
+    if st.session_state.chart_cursor_signature != signature:
+        st.session_state.chart_cursor_signature = signature
+        st.session_state.chart_cursor = max(0, len(display_bars) - 1)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        initial_cash = st.number_input(
-            "初期資金",
-            min_value=10_000.0,
-            value=1_000_000.0,
-            step=100_000.0,
-            format="%.0f",
-        )
-    with c2:
-        short_n = st.number_input("短期MA", min_value=2, max_value=200, value=20, step=1)
-    with c3:
-        long_n = st.number_input("長期MA", min_value=3, max_value=400, value=60, step=1)
+    max_cursor = max(0, len(display_bars) - 1)
+    cursor = st.session_state.chart_cursor
+    if cursor is None:
+        cursor = max_cursor
+    cursor = max(0, min(int(cursor), max_cursor))
+    st.session_state.chart_cursor = cursor
 
-    if short_n >= long_n:
-        st.warning("短期MAは長期MAより小さくしてください。")
-    elif len(data) <= long_n + 2:
-        st.warning("選択期間が短すぎます。開始日を古くしてください。")
-    else:
-        bt, trades, metrics = backtest_ma(
-            data,
-            initial_cash=initial_cash,
-            short_n=int(short_n),
-            long_n=int(long_n),
-            commission_pct=commission_pct,
-            slippage_pct=slippage_pct,
+    nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 3])
+    with nav1:
+        if st.button("◀ 1足戻す", disabled=cursor <= 0, use_container_width=True):
+            st.session_state.chart_cursor = max(0, cursor - 1)
+            st.rerun()
+    with nav2:
+        if st.button("1足進める ▶", disabled=cursor >= max_cursor, use_container_width=True):
+            st.session_state.chart_cursor = min(max_cursor, cursor + 1)
+            st.rerun()
+    with nav3:
+        if st.button("最新へ", disabled=cursor >= max_cursor, use_container_width=True):
+            st.session_state.chart_cursor = max_cursor
+            st.rerun()
+    with nav4:
+        shown_date = display_bars.index[cursor]
+        st.write(
+            f"表示最終足: **{shown_date.date().isoformat()}**　"
+            f"({cursor + 1}/{len(display_bars)}足)"
         )
 
-        a, b, c, d, e = st.columns(5)
-        a.metric("最終資産", f"{metrics['final_equity']:,.0f}")
-        b.metric("戦略収益率", f"{metrics['total_return']:+.2f}%")
-        c.metric("単純保有リターン", f"{metrics['benchmark']:+.2f}%")
-        d.metric("最大DD", f"{metrics['max_drawdown']:.2f}%")
-        e.metric(
-            "勝率",
-            "―" if np.isnan(metrics["win_rate"]) else f"{metrics['win_rate']:.1f}%",
-            f"決済 {metrics['closed_trades']}回",
+    chart_data = display_bars.iloc[: cursor + 1].copy()
+    if not chart_data.empty:
+        latest = chart_data.iloc[-1]
+        prev = chart_data.iloc[-2] if len(chart_data) >= 2 else latest
+        delta = latest["Close"] - prev["Close"]
+        delta_pct = delta / prev["Close"] * 100 if prev["Close"] else 0.0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("終値", fmt_price(float(latest["Close"])), f"{delta:+,.2f}")
+        m2.metric("前足比", f"{delta_pct:+.2f}%")
+        m3.metric("出来高", f"{latest['Volume']:,.0f}")
+        rsi = latest.get("RSI14", np.nan)
+        m4.metric("RSI(14)", "―" if pd.isna(rsi) else f"{float(rsi):.1f}")
+
+        st.plotly_chart(
+            stock_chart(chart_data, ticker, timeframe, sma_list),
+            use_container_width=True,
+            config={"displaylogo": False},
         )
 
-        eq_fig = go.Figure()
-        eq_fig.add_trace(
-            go.Scatter(
-                x=bt.index,
-                y=bt["Equity"],
-                mode="lines",
-                name="戦略資産",
-            )
-        )
-        benchmark_equity = initial_cash * bt["Close"] / bt["Close"].iloc[0]
-        eq_fig.add_trace(
-            go.Scatter(
-                x=bt.index,
-                y=benchmark_equity,
-                mode="lines",
-                name="単純保有（比較）",
-            )
-        )
-        eq_fig.update_layout(
-            title="資産推移",
-            height=420,
-            hovermode="x unified",
-            legend=dict(orientation="h"),
-            margin=dict(l=30, r=20, t=55, b=20),
-        )
-        st.plotly_chart(eq_fig, use_container_width=True, config={"displaylogo": False})
-
-        if metrics["open_position"] > 0:
-            st.info(
-                f"期間終了時点で {metrics['open_position']:,} 株を保有したままです。"
-                " 最終資産は最終終値で時価評価しています。"
-            )
-
-        st.markdown("#### 売買履歴")
-        if trades.empty:
-            st.write("期間内に売買シグナルはありませんでした。")
-        else:
-            st.dataframe(trades, use_container_width=True, hide_index=True)
+        with st.expander("表示中の価格データ"):
+            view = chart_data.reset_index().rename(columns={"index": "Date"})
+            st.dataframe(view.tail(250), use_container_width=True, hide_index=True)
             st.download_button(
-                "売買履歴CSVをダウンロード",
-                data=trades.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{ticker}_ma_backtest_trades.csv",
+                "価格データCSVをダウンロード",
+                data=view.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{ticker}_{timeframe}_prices.csv",
                 mime="text/csv",
             )
 
-with tab3:
-    st.subheader("指定日の1往復売買を試算")
-    st.write(
-        "指定日が休場日の場合は、その日以降で最初の取引日の始値を使います。"
-        " 購入・売却とも始値約定として計算します。"
-    )
+with tab_sim:
+    sim = st.session_state.sim
 
-    min_date = data.index.min().date()
-    max_date = data.index.max().date()
-    span = (max_date - min_date).days
-    default_buy = min_date + dt.timedelta(days=max(1, int(span * 0.35)))
-    default_sell = min_date + dt.timedelta(days=max(2, int(span * 0.70)))
-    if default_sell > max_date:
-        default_sell = max_date
-
-    x1, x2, x3 = st.columns(3)
-    with x1:
-        buy_date = st.date_input(
-            "購入日",
-            value=default_buy,
-            min_value=min_date,
-            max_value=max_date,
-            key="manual_buy",
-        )
-    with x2:
-        sell_date = st.date_input(
-            "売却日",
-            value=default_sell,
-            min_value=min_date,
-            max_value=max_date,
-            key="manual_sell",
-        )
-    with x3:
-        shares = st.number_input(
-            "株数",
-            min_value=1,
-            value=100,
-            step=1,
+    if not sim["active"]:
+        st.subheader("シミュレーション開始")
+        st.write(
+            "開始すると、指定した取引日より後の価格はアプリ全体で非表示になります。"
+            " その後は「次の取引日へ」で1日ずつ進めます。"
         )
 
-    try:
-        result = manual_trade_sim(
-            data,
-            buy_date=buy_date,
-            sell_date=sell_date,
-            shares=int(shares),
-            commission_pct=commission_pct,
-            slippage_pct=slippage_pct,
-        )
+        s1, s2 = st.columns(2)
+        with s1:
+            sim_start_date = st.date_input(
+                "開始日",
+                value=max(
+                    prices.index.min().date(),
+                    prices.index.max().date() - dt.timedelta(days=180),
+                ),
+                min_value=prices.index.min().date(),
+                max_value=prices.index.max().date(),
+                key="sim_start_date",
+            )
+        with s2:
+            initial_cash = st.number_input(
+                "初期資金",
+                min_value=10_000.0,
+                value=1_000_000.0,
+                step=100_000.0,
+                format="%.0f",
+                key="sim_initial_cash",
+            )
+
+        if st.button("▶ シミュレーション開始", type="primary", use_container_width=True):
+            candidates = np.where(prices.index.date >= sim_start_date)[0]
+            if len(candidates) == 0:
+                st.error("開始日以降の取引日がありません。")
+            else:
+                idx = int(candidates[0])
+                new_sim = empty_sim_state()
+                new_sim.update(
+                    {
+                        "active": True,
+                        "ticker": ticker,
+                        "current_idx": idx,
+                        "start_idx": idx,
+                        "initial_cash": float(initial_cash),
+                        "cash": float(initial_cash),
+                    }
+                )
+                st.session_state.sim = new_sim
+                st.session_state.chart_cursor = None
+                st.session_state.chart_cursor_signature = None
+                st.rerun()
+
+    else:
+        current_idx = min(int(sim["current_idx"]), len(prices) - 1)
+        current_date = prices.index[current_idx]
+        current_row = prices.iloc[current_idx]
+        current_close = float(current_row["Close"])
+
+        top1, top2, top3 = st.columns([2, 2, 1])
+        with top1:
+            st.markdown(f"### 現在日: {current_date.date().isoformat()}")
+        with top2:
+            if current_idx < len(prices) - 1:
+                next_date = prices.index[current_idx + 1].date().isoformat()
+                st.caption(f"次の取引日: {next_date}")
+            else:
+                st.caption("取得済みデータの最終取引日です。")
+        with top3:
+            if st.button("終了", use_container_width=True):
+                st.session_state.sim = empty_sim_state()
+                st.session_state.chart_cursor = None
+                st.session_state.chart_cursor_signature = None
+                st.rerun()
+
+        spot_u, long_u, short_u, total_u = unrealized_pnl(sim, current_close)
+        net_assets = sim["cash"] + sim["spot_qty"] * current_close + long_u + short_u
+
         r1, r2, r3, r4 = st.columns(4)
-        r1.metric("購入総額", f"{result['購入総額']:,.0f}")
-        r2.metric("売却受取額", f"{result['売却受取額']:,.0f}")
-        r3.metric("損益", f"{result['損益']:+,.0f}")
-        r4.metric("収益率", f"{result['収益率']:+.2f}%")
+        r1.metric("現物", f"{sim['spot_qty']:,}株")
+        r2.metric("信用買い", f"{sim['margin_long_qty']:,}株")
+        r3.metric("信用売り", f"{sim['margin_short_qty']:,}株")
+        r4.metric("現金", f"{sim['cash']:,.0f}")
 
-        details = pd.DataFrame(
-            [
-                ["購入取引日", result["購入取引日"]],
-                ["売却取引日", result["売却取引日"]],
-                ["購入約定価格", f"{result['購入約定価格']:,.4f}"],
-                ["売却約定価格", f"{result['売却約定価格']:,.4f}"],
-                ["株数", f"{int(shares):,}"],
-            ],
-            columns=["項目", "値"],
+        p1, p2, p3 = st.columns(3)
+        p1.metric("確定損益", f"{sim['realized_pnl']:+,.0f}")
+        p2.metric("含み損益", f"{total_u:+,.0f}")
+        p3.metric("参考純資産", f"{net_assets:,.0f}")
+
+        pos_rows = []
+        if sim["spot_qty"]:
+            pos_rows.append(
+                ["現物", sim["spot_qty"], sim["spot_avg"], current_close, spot_u]
+            )
+        if sim["margin_long_qty"]:
+            pos_rows.append(
+                [
+                    "信用買い",
+                    sim["margin_long_qty"],
+                    sim["margin_long_avg"],
+                    current_close,
+                    long_u,
+                ]
+            )
+        if sim["margin_short_qty"]:
+            pos_rows.append(
+                [
+                    "信用売り",
+                    sim["margin_short_qty"],
+                    sim["margin_short_avg"],
+                    current_close,
+                    short_u,
+                ]
+            )
+        if pos_rows:
+            st.dataframe(
+                pd.DataFrame(
+                    pos_rows,
+                    columns=["区分", "株数", "平均建値", "現在値", "含み損益"],
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("#### 注文入力")
+        if sim["pending_order"] is not None:
+            po = sim["pending_order"]
+            limit_text = (
+                ""
+                if po.get("limit_price") is None
+                else f" / 指値 {po['limit_price']:,.2f}"
+            )
+            st.warning(
+                f"翌取引日へ発注済み: {po['account_type']} {po['side']} "
+                f"{po['qty']:,}株 / {po['method']}{limit_text}"
+            )
+            if st.button("未執行注文を取消"):
+                sim["pending_order"] = None
+                st.rerun()
+        else:
+            o1, o2, o3, o4 = st.columns(4)
+            with o1:
+                account_type = st.selectbox("取引区分", ["現物", "信用"])
+            with o2:
+                side = st.selectbox("売買", ["買い", "売り"])
+            with o3:
+                qty = st.number_input("株数", min_value=1, value=100, step=1)
+            with o4:
+                method = st.selectbox("売買方法", ["寄り成り", "引け成り", "指値"])
+
+            limit_price = None
+            if method == "指値":
+                limit_price = st.number_input(
+                    "指値",
+                    min_value=0.01,
+                    value=float(round(current_close, 2)),
+                    step=0.5,
+                    format="%.2f",
+                )
+
+            if current_idx >= len(prices) - 1:
+                st.info("次の取引日データがないため、新規注文は出せません。")
+            elif st.button("翌取引日に注文", type="primary", use_container_width=True):
+                sim["pending_order"] = {
+                    "order_date": current_date.date().isoformat(),
+                    "account_type": account_type,
+                    "side": side,
+                    "qty": int(qty),
+                    "method": method,
+                    "limit_price": float(limit_price) if limit_price is not None else None,
+                    "commission_pct": float(commission_pct),
+                    "slippage_pct": float(slippage_pct),
+                }
+                st.rerun()
+
+        st.markdown("#### 日付を進める")
+        if st.button(
+            "次の取引日へ ▶",
+            type="primary",
+            use_container_width=True,
+            disabled=current_idx >= len(prices) - 1,
+        ):
+            next_idx = current_idx + 1
+            next_date = prices.index[next_idx]
+            next_row = prices.iloc[next_idx]
+            process_pending_order(sim, next_date, next_row)
+            sim["current_idx"] = next_idx
+            st.session_state.chart_cursor = None
+            st.session_state.chart_cursor_signature = None
+            st.rerun()
+
+        st.caption(
+            "注文は入力日の翌取引日にのみ執行判定します。"
+            " 信用取引は簡易モデルで、委託保証金率・金利・貸株料・追証・強制決済は未実装です。"
         )
-        st.dataframe(details, use_container_width=True, hide_index=True)
-    except ValueError as e:
-        st.warning(str(e))
+
+        if sim["order_log"]:
+            st.markdown("#### 注文履歴")
+            st.dataframe(
+                pd.DataFrame(sim["order_log"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if sim["trade_log"]:
+            st.markdown("#### 約定履歴")
+            trades = pd.DataFrame(sim["trade_log"])
+            st.dataframe(trades, use_container_width=True, hide_index=True)
+            st.download_button(
+                "約定履歴CSVをダウンロード",
+                data=trades.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{ticker}_manual_sim_trades.csv",
+                mime="text/csv",
+            )
 
 st.divider()
 st.caption(
-    "注意: yfinance/Yahoo Financeのデータは遅延・欠損・修正があり得ます。"
-    " 本アプリは学習・検証用で、投資助言や実際の注文機能ではありません。"
+    "注意: Yahoo Finance/yfinanceのデータは遅延・欠損・修正があり得ます。"
+    " 本アプリは学習・検証用で、投資助言や証券会社への注文機能ではありません。"
 )
