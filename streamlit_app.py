@@ -118,7 +118,13 @@ def add_indicators(df: pd.DataFrame, sma_list: list[int]) -> pd.DataFrame:
     return out
 
 
-def stock_chart(df: pd.DataFrame, ticker: str, timeframe: str, sma_list: list[int]) -> go.Figure:
+def stock_chart(
+    df: pd.DataFrame,
+    ticker: str,
+    timeframe: str,
+    sma_list: list[int],
+    view_revision: str,
+) -> go.Figure:
     """
     A category x-axis intentionally removes weekend/holiday gaps.
     Each candle occupies one equal horizontal step.
@@ -171,6 +177,8 @@ def stock_chart(df: pd.DataFrame, ticker: str, timeframe: str, sma_list: list[in
         hovermode="x unified",
         legend=dict(orientation="h"),
         margin=dict(l=30, r=20, t=60, b=20),
+        uirevision=view_revision,
+        dragmode="zoom",
     )
     for row in (1, 2, 3):
         fig.update_xaxes(type="category", row=row, col=1)
@@ -446,6 +454,14 @@ with st.sidebar:
     timeframe = st.radio("足種", ["日足", "週足", "月足"], horizontal=True)
 
     st.subheader("チャート")
+    chart_window_bars = st.number_input(
+        "表示本数",
+        min_value=10,
+        max_value=250,
+        value=60,
+        step=5,
+        help="順送り・逆送りではこの本数を固定したまま1足ずつ横へスライドします。",
+    )
     sma_list = st.multiselect(
         "移動平均",
         options=[5, 10, 20, 25, 50, 60, 75, 100, 200],
@@ -519,39 +535,89 @@ with tab_chart:
             " 未来の価格データは非表示です。"
         )
 
-    signature = (ticker, timeframe, cutoff_date.date().isoformat(), len(display_bars))
+    signature = (ticker, timeframe)
     if st.session_state.chart_cursor_signature != signature:
         st.session_state.chart_cursor_signature = signature
         st.session_state.chart_cursor = max(0, len(display_bars) - 1)
 
     max_cursor = max(0, len(display_bars) - 1)
+    window_size = min(int(chart_window_bars), len(display_bars))
+    min_cursor = max(0, window_size - 1)
+
     cursor = st.session_state.chart_cursor
     if cursor is None:
         cursor = max_cursor
-    cursor = max(0, min(int(cursor), max_cursor))
+    cursor = max(min_cursor, min(int(cursor), max_cursor))
     st.session_state.chart_cursor = cursor
 
-    nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 3])
+    if sim["active"]:
+        nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 1.25, 1, 2.4])
+    else:
+        nav1, nav2, nav3, nav5 = st.columns([1, 1, 1, 3])
+        nav4 = None
+
     with nav1:
-        if st.button("◀ 1足戻す", disabled=cursor <= 0, use_container_width=True):
-            st.session_state.chart_cursor = max(0, cursor - 1)
+        if st.button(
+            "◀ 1足戻す",
+            disabled=cursor <= min_cursor,
+            use_container_width=True,
+        ):
+            st.session_state.chart_cursor = max(min_cursor, cursor - 1)
             st.rerun()
+
     with nav2:
-        if st.button("1足進める ▶", disabled=cursor >= max_cursor, use_container_width=True):
+        if st.button(
+            "1足進める ▶",
+            disabled=cursor >= max_cursor,
+            use_container_width=True,
+        ):
             st.session_state.chart_cursor = min(max_cursor, cursor + 1)
             st.rerun()
+
     with nav3:
         if st.button("最新へ", disabled=cursor >= max_cursor, use_container_width=True):
             st.session_state.chart_cursor = max_cursor
             st.rerun()
-    with nav4:
-        shown_date = display_bars.index[cursor]
+
+    if sim["active"] and nav4 is not None:
+        with nav4:
+            current_idx_for_chart = min(int(sim["current_idx"]), len(prices) - 1)
+            if st.button(
+                "次の取引日へ ▶",
+                type="primary",
+                use_container_width=True,
+                disabled=current_idx_for_chart >= len(prices) - 1,
+                help="未来を1取引日だけ開示し、チャート表示を同じ倍率のまま右へ進めます。",
+            ):
+                next_idx = current_idx_for_chart + 1
+                next_date = prices.index[next_idx]
+                next_row = prices.iloc[next_idx]
+
+                old_bar_count = len(display_bars)
+                process_pending_order(sim, next_date, next_row)
+                sim["current_idx"] = next_idx
+
+                next_visible = prices.iloc[: next_idx + 1].copy()
+                new_bar_count = len(aggregate_prices(next_visible, timeframe))
+                added_bars = max(0, new_bar_count - old_bar_count)
+
+                st.session_state.chart_cursor = min(
+                    cursor + added_bars,
+                    max_cursor + added_bars,
+                )
+                st.rerun()
+
+    with nav5:
+        window_start = max(0, cursor - window_size + 1)
+        shown_start = display_bars.index[window_start]
+        shown_end = display_bars.index[cursor]
         st.write(
-            f"表示最終足: **{shown_date.date().isoformat()}**　"
-            f"({cursor + 1}/{len(display_bars)}足)"
+            f"表示: **{shown_start.date().isoformat()} ～ {shown_end.date().isoformat()}**　"
+            f"({window_size}足)"
         )
 
-    chart_data = display_bars.iloc[: cursor + 1].copy()
+    window_start = max(0, cursor - window_size + 1)
+    chart_data = display_bars.iloc[window_start : cursor + 1].copy()
     if not chart_data.empty:
         latest = chart_data.iloc[-1]
         prev = chart_data.iloc[-2] if len(chart_data) >= 2 else latest
@@ -566,9 +632,20 @@ with tab_chart:
         m4.metric("RSI(14)", "―" if pd.isna(rsi) else f"{float(rsi):.1f}")
 
         st.plotly_chart(
-            stock_chart(chart_data, ticker, timeframe, sma_list),
+            stock_chart(
+                chart_data,
+                ticker,
+                timeframe,
+                sma_list,
+                view_revision=f"{ticker}-{timeframe}-{window_size}",
+            ),
             use_container_width=True,
-            config={"displaylogo": False},
+            key="main_stock_chart",
+            config={
+                "displaylogo": False,
+                "scrollZoom": True,
+                "doubleClick": "reset",
+            },
         )
 
         with st.expander("表示中の価格データ"):
@@ -588,7 +665,7 @@ with tab_sim:
         st.subheader("シミュレーション開始")
         st.write(
             "開始すると、指定した取引日より後の価格はアプリ全体で非表示になります。"
-            " その後は「次の取引日へ」で1日ずつ進めます。"
+            " 開始後はチャートタブの「次の取引日へ」で1日ずつ進めます。"
         )
 
         s1, s2 = st.columns(2)
@@ -756,22 +833,6 @@ with tab_sim:
                     "slippage_pct": float(slippage_pct),
                 }
                 st.rerun()
-
-        st.markdown("#### 日付を進める")
-        if st.button(
-            "次の取引日へ ▶",
-            type="primary",
-            use_container_width=True,
-            disabled=current_idx >= len(prices) - 1,
-        ):
-            next_idx = current_idx + 1
-            next_date = prices.index[next_idx]
-            next_row = prices.iloc[next_idx]
-            process_pending_order(sim, next_date, next_row)
-            sim["current_idx"] = next_idx
-            st.session_state.chart_cursor = None
-            st.session_state.chart_cursor_signature = None
-            st.rerun()
 
         st.caption(
             "注文は入力日の翌取引日にのみ執行判定します。"
