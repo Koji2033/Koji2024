@@ -7,9 +7,14 @@
     "README_IPAD.md"
   ],
   "default_ticker": "7203.T",
+  "default_history": "2 years",
+  "default_visible_bars": 60,
   "features": [
     "Candlestick chart",
     "Daily weekly monthly timeframe",
+    "Two-year price preload",
+    "Chart period slider",
+    "Loaded-history pinch and wheel zoom",
     "One-bar chart navigation",
     "No trading-day gaps on daily chart",
     "Volume",
