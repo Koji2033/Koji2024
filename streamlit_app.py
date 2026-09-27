@@ -603,7 +603,6 @@ with tab_chart:
         "表示期間（足数）",
         min_value=slider_min,
         max_value=slider_max,
-        value=int(st.session_state[window_key]),
         step=1,
         key=window_key,
         help="初期値は60足。2年分の読み込み済みデータから表示期間だけを変更します。",
