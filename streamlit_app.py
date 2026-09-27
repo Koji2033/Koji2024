@@ -8,6 +8,19 @@ import streamlit as st
 import yfinance as yf
 
 
+SMA_COLORS = [
+    "#E53935",  # 赤
+    "#43A047",  # 緑
+    "#1E88E5",  # 青
+    "#FDD835",  # 黄
+    "#FB8C00",  # オレンジ
+    "#EF9A9A",  # 薄い赤
+    "#A5D6A7",  # 薄い緑
+    "#90CAF9",  # 薄い青
+    "#FFCC80",  # 薄いオレンジ
+]
+
+
 st.set_page_config(
     page_title="株価チャート・手動売買シミュレーター",
     page_icon="📈",
@@ -105,7 +118,7 @@ def aggregate_prices(daily: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 
 def add_indicators(df: pd.DataFrame, sma_list: list[int]) -> pd.DataFrame:
     out = df.copy()
-    for n in sorted(set(sma_list)):
+    for n in dict.fromkeys(sma_list):
         out[f"SMA{n}"] = out["Close"].rolling(n).mean()
 
     delta = out["Close"].diff()
@@ -158,11 +171,20 @@ def stock_chart(
         col=1,
     )
 
-    for n in sorted(set(sma_list)):
+    for color_index, n in enumerate(dict.fromkeys(sma_list)):
         col = f"SMA{n}"
         if col in df.columns:
             fig.add_trace(
-                go.Scatter(x=x, y=df[col], mode="lines", name=f"SMA {n}"),
+                go.Scatter(
+                    x=x,
+                    y=df[col],
+                    mode="lines",
+                    name=f"SMA {n}",
+                    line=dict(
+                        color=SMA_COLORS[color_index % len(SMA_COLORS)],
+                        width=2,
+                    ),
+                ),
                 row=1,
                 col=1,
             )
@@ -183,7 +205,7 @@ def stock_chart(
         hovermode="x unified",
         legend=dict(orientation="h"),
         margin=dict(l=30, r=20, t=60, b=20),
-        dragmode="zoom",
+        dragmode="pan",
     )
 
     # Category axes use zero-based category serial positions for numeric ranges.
@@ -488,49 +510,50 @@ st.title("📈 株価チャート・手動売買シミュレーター")
 st.caption("価格データ: Yahoo Finance（yfinance）。実注文は行わない学習・検証用アプリです。")
 
 with st.sidebar:
-    st.header("基本設定")
-    ticker = st.text_input(
-        "銘柄コード",
-        value="7203.T",
-        help="日本株は例: 7203.T、米国株は例: AAPL",
-    ).strip().upper()
+    with st.expander("基本設定", expanded=True):
+        st.header("基本設定")
+        ticker = st.text_input(
+            "銘柄コード",
+            value="7203.T",
+            help="日本株は例: 7203.T、米国株は例: AAPL",
+        ).strip().upper()
 
-    today = dt.date.today()
-    default_start = today - dt.timedelta(days=365 * 2)
-    start = st.date_input("データ開始日", value=default_start)
-    end = st.date_input("データ終了日", value=today)
+        today = dt.date.today()
+        default_start = today - dt.timedelta(days=365 * 2)
+        start = st.date_input("データ開始日", value=default_start)
+        end = st.date_input("データ終了日", value=today)
 
-    timeframe = st.radio("足種", ["日足", "週足", "月足"], horizontal=True)
+        timeframe = st.radio("足種", ["日足", "週足", "月足"], horizontal=True)
 
-    st.subheader("チャート")
-    sma_list = st.multiselect(
-        "移動平均",
-        options=[5, 10, 20, 25, 50, 60, 75, 100, 200],
-        default=[5, 20, 60],
-    )
+        st.subheader("チャート")
+        sma_list = st.multiselect(
+            "移動平均",
+            options=[5, 10, 20, 25, 50, 60, 75, 100, 200],
+            default=[5, 20, 60],
+        )
 
-    st.subheader("売買コスト")
-    commission_pct = st.number_input(
-        "片道手数料 (%)",
-        min_value=0.0,
-        max_value=10.0,
-        value=0.0,
-        step=0.01,
-        format="%.3f",
-    )
-    slippage_pct = st.number_input(
-        "成行スリッページ (%)",
-        min_value=0.0,
-        max_value=10.0,
-        value=0.05,
-        step=0.01,
-        format="%.3f",
-        help="寄り成り・引け成りに適用。指値では価格改善ルールを優先します。",
-    )
+        st.subheader("売買コスト")
+        commission_pct = st.number_input(
+            "片道手数料 (%)",
+            min_value=0.0,
+            max_value=10.0,
+            value=0.0,
+            step=0.01,
+            format="%.3f",
+        )
+        slippage_pct = st.number_input(
+            "成行スリッページ (%)",
+            min_value=0.0,
+            max_value=10.0,
+            value=0.05,
+            step=0.01,
+            format="%.3f",
+            help="寄り成り・引け成りに適用。指値では価格改善ルールを優先します。",
+        )
 
-    if st.button("価格データを再取得", use_container_width=True):
-        load_prices.clear()
-        st.rerun()
+        if st.button("価格データを再取得", use_container_width=True):
+            load_prices.clear()
+            st.rerun()
 
 if not ticker:
     st.warning("銘柄コードを入力してください。")
@@ -793,6 +816,7 @@ with tab_chart:
         st.caption(
             "左右2つのハンドルで表示期間を自由に調整できます。"
             " 順送り・逆送りでは選択幅と縦倍率を保ったまま1足ずつ横へスライドします。"
+            " チャート上の1本指ドラッグはパン（移動）が既定です。"
         )
 
         with st.expander("表示中の価格データ"):
