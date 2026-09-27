@@ -576,46 +576,36 @@ with tab_chart:
             " 未来の価格データは非表示です。"
         )
 
-    signature = (ticker, timeframe)
-    if st.session_state.chart_cursor_signature != signature:
-        st.session_state.chart_cursor_signature = signature
-        st.session_state.chart_cursor = max(0, len(display_bars) - 1)
+    max_cursor = max(0, len(display_bars) - 1)
+    bar_dates = [d.date() for d in display_bars.index]
+    date_to_index = {d: i for i, d in enumerate(bar_dates)}
+
+    range_key = f"chart_range::{ticker}::{timeframe}"
+    shift_flag_key = f"chart_range_shifted::{ticker}::{timeframe}"
+    last_range_key = f"chart_range_last::{ticker}::{timeframe}"
+
+    default_start_idx = max(0, len(display_bars) - 60)
+    default_range = (bar_dates[default_start_idx], bar_dates[-1])
+
+    # If the instrument/timeframe changed, or simulation hides dates that had
+    # previously been selected, reset to the latest 60 available bars.
+    current_saved_range = st.session_state.get(range_key)
+    if (
+        current_saved_range is None
+        or len(current_saved_range) != 2
+        or current_saved_range[0] not in date_to_index
+        or current_saved_range[1] not in date_to_index
+        or current_saved_range[0] > current_saved_range[1]
+    ):
+        st.session_state[range_key] = default_range
+        st.session_state[last_range_key] = default_range
+        st.session_state[shift_flag_key] = False
         st.session_state.chart_scale_reset_token += 1
 
-    max_cursor = max(0, len(display_bars) - 1)
-
-    # The period slider is the authoritative horizontal zoom for navigation.
-    # All available bars remain loaded in Plotly, so pinch/wheel zoom-out does
-    # not require another Yahoo Finance request.
-    slider_max = max(1, len(display_bars))
-    slider_min = min(10, slider_max)
-    slider_default = min(60, slider_max)
-    window_key = f"chart_window_bars::{ticker}::{timeframe}"
-    if window_key not in st.session_state:
-        st.session_state[window_key] = slider_default
-    else:
-        st.session_state[window_key] = max(
-            slider_min,
-            min(int(st.session_state[window_key]), slider_max),
-        )
-
-    chart_window_bars = st.slider(
-        "表示期間（足数）",
-        min_value=slider_min,
-        max_value=slider_max,
-        step=1,
-        key=window_key,
-        help="初期値は60足。2年分の読み込み済みデータから表示期間だけを変更します。",
-    )
-
-    window_size = min(int(chart_window_bars), len(display_bars))
-    min_cursor = max(0, window_size - 1)
-
-    cursor = st.session_state.chart_cursor
-    if cursor is None:
-        cursor = max_cursor
-    cursor = max(min_cursor, min(int(cursor), max_cursor))
-    st.session_state.chart_cursor = cursor
+    saved_start_date, saved_end_date = st.session_state[range_key]
+    saved_start_idx = date_to_index[saved_start_date]
+    saved_end_idx = date_to_index[saved_end_date]
+    saved_width = saved_end_idx - saved_start_idx + 1
 
     if sim["active"]:
         nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 1.25, 1, 2.4])
@@ -626,24 +616,46 @@ with tab_chart:
     with nav1:
         if st.button(
             "◀ 1足戻す",
-            disabled=cursor <= min_cursor,
+            disabled=saved_start_idx <= 0,
             use_container_width=True,
         ):
-            st.session_state.chart_cursor = max(min_cursor, cursor - 1)
+            new_start_idx = max(0, saved_start_idx - 1)
+            new_end_idx = new_start_idx + saved_width - 1
+            st.session_state[range_key] = (
+                bar_dates[new_start_idx],
+                bar_dates[new_end_idx],
+            )
+            st.session_state[shift_flag_key] = True
             st.rerun()
 
     with nav2:
         if st.button(
             "1足進める ▶",
-            disabled=cursor >= max_cursor,
+            disabled=saved_end_idx >= max_cursor,
             use_container_width=True,
         ):
-            st.session_state.chart_cursor = min(max_cursor, cursor + 1)
+            new_end_idx = min(max_cursor, saved_end_idx + 1)
+            new_start_idx = new_end_idx - saved_width + 1
+            st.session_state[range_key] = (
+                bar_dates[new_start_idx],
+                bar_dates[new_end_idx],
+            )
+            st.session_state[shift_flag_key] = True
             st.rerun()
 
     with nav3:
-        if st.button("最新へ", disabled=cursor >= max_cursor, use_container_width=True):
-            st.session_state.chart_cursor = max_cursor
+        if st.button(
+            "最新へ",
+            disabled=saved_end_idx >= max_cursor,
+            use_container_width=True,
+        ):
+            new_end_idx = max_cursor
+            new_start_idx = max(0, new_end_idx - saved_width + 1)
+            st.session_state[range_key] = (
+                bar_dates[new_start_idx],
+                bar_dates[new_end_idx],
+            )
+            st.session_state[shift_flag_key] = False
             st.session_state.chart_scale_reset_token += 1
             st.rerun()
 
@@ -655,7 +667,7 @@ with tab_chart:
                 type="primary",
                 use_container_width=True,
                 disabled=current_idx_for_chart >= len(prices) - 1,
-                help="未来を1取引日だけ開示し、現在の表示期間を保ったまま右へ進めます。",
+                help="未来を1取引日だけ開示し、現在の表示幅を保ったまま右へ進めます。",
             ):
                 next_idx = current_idx_for_chart + 1
                 next_date = prices.index[next_idx]
@@ -666,20 +678,56 @@ with tab_chart:
                 sim["current_idx"] = next_idx
 
                 next_visible = prices.iloc[: next_idx + 1].copy()
-                new_bar_count = len(aggregate_prices(next_visible, timeframe))
+                next_bars = aggregate_prices(next_visible, timeframe)
+                new_bar_count = len(next_bars)
                 added_bars = max(0, new_bar_count - old_bar_count)
 
-                st.session_state.chart_cursor = min(
-                    cursor + added_bars,
-                    max_cursor + added_bars,
-                )
+                if added_bars > 0:
+                    next_bar_dates = [d.date() for d in next_bars.index]
+                    new_end_idx = min(
+                        len(next_bar_dates) - 1,
+                        saved_end_idx + added_bars,
+                    )
+                    new_start_idx = max(0, new_end_idx - saved_width + 1)
+                    st.session_state[range_key] = (
+                        next_bar_dates[new_start_idx],
+                        next_bar_dates[new_end_idx],
+                    )
+                st.session_state[shift_flag_key] = True
                 st.rerun()
 
-    window_start = max(0, cursor - window_size + 1)
+    with nav5:
+        st.write(
+            f"表示: **{saved_start_date.isoformat()} ～ {saved_end_date.isoformat()}**　"
+            f"({saved_width}足 / 読込済み {len(display_bars)}足)"
+        )
+
+    selected_range = st.select_slider(
+        "表示範囲",
+        options=bar_dates,
+        value=st.session_state[range_key],
+        key=range_key,
+        help="左右のハンドルを個別に動かして表示開始日・終了日を調整できます。",
+    )
+
+    start_date_selected, end_date_selected = selected_range
+    window_start = date_to_index[start_date_selected]
+    cursor = date_to_index[end_date_selected]
+    window_size = cursor - window_start + 1
     window_view = display_bars.iloc[window_start : cursor + 1].copy()
 
-    # Recalculate the default vertical scale only when the instrument,
-    # timeframe or selected period changes (or when "latest" requests a reset).
+    previous_range = st.session_state.get(last_range_key)
+    shifted_programmatically = bool(st.session_state.get(shift_flag_key, False))
+    range_changed = previous_range != selected_range
+
+    # Manual range changes recalculate the vertical scale. One-bar navigation
+    # keeps the existing vertical magnification, matching the sliding-chart behavior.
+    if range_changed and not shifted_programmatically:
+        st.session_state.chart_scale_reset_token += 1
+
+    st.session_state[last_range_key] = selected_range
+    st.session_state[shift_flag_key] = False
+
     scale_signature = (
         ticker,
         timeframe,
@@ -698,13 +746,12 @@ with tab_chart:
         vol_max = float(window_view["Volume"].max()) if len(window_view) else 0.0
         st.session_state.chart_volume_range = (0.0, max(1.0, vol_max * 1.12))
 
-    with nav5:
-        shown_start = display_bars.index[window_start]
-        shown_end = display_bars.index[cursor]
-        st.write(
-            f"表示: **{shown_start.date().isoformat()} ～ {shown_end.date().isoformat()}**　"
-            f"({window_size}足 / 読込済み {len(display_bars)}足)"
-        )
+    shown_start = display_bars.index[window_start]
+    shown_end = display_bars.index[cursor]
+    st.caption(
+        f"選択範囲: {shown_start.date().isoformat()} ～ {shown_end.date().isoformat()} "
+        f"（{window_size}足）"
+    )
 
     if not window_view.empty:
         latest = display_bars.iloc[cursor]
@@ -729,7 +776,7 @@ with tab_chart:
                 view_end=cursor,
                 price_range=st.session_state.chart_price_range,
                 volume_range=st.session_state.chart_volume_range,
-                x_revision=f"{ticker}-{timeframe}-{window_size}-{cursor}",
+                x_revision=f"{ticker}-{timeframe}-{window_start}-{cursor}",
                 y_revision=f"{ticker}-{timeframe}-{window_size}-{st.session_state.chart_scale_reset_token}",
             ),
             use_container_width=True,
@@ -742,9 +789,8 @@ with tab_chart:
         )
 
         st.caption(
-            "チャートには現在利用可能な全履歴を読み込んでいます。"
-            " ピンチ/ホイールでズームアウトしても追加の株価取得は不要です。"
-            " 順送り・逆送り時の横方向の表示期間は上のスライダー値を維持します。"
+            "左右2つのハンドルで表示期間を自由に調整できます。"
+            " 順送り・逆送りでは選択幅と縦倍率を保ったまま1足ずつ横へスライドします。"
         )
 
         with st.expander("表示中の価格データ"):
