@@ -123,11 +123,17 @@ def stock_chart(
     ticker: str,
     timeframe: str,
     sma_list: list[int],
-    view_revision: str,
+    view_start: int,
+    view_end: int,
+    price_range: tuple[float, float],
+    volume_range: tuple[float, float],
+    x_revision: str,
+    y_revision: str,
 ) -> go.Figure:
     """
-    A category x-axis intentionally removes weekend/holiday gaps.
-    Each candle occupies one equal horizontal step.
+    Load the whole available history into Plotly, but show only view_start:view_end.
+    A categorical x-axis removes weekend/holiday gaps while keeping all loaded bars
+    immediately available for zoom-out and pan.
     """
     fig = make_subplots(
         rows=3,
@@ -177,24 +183,59 @@ def stock_chart(
         hovermode="x unified",
         legend=dict(orientation="h"),
         margin=dict(l=30, r=20, t=60, b=20),
-        uirevision=view_revision,
         dragmode="zoom",
     )
+
+    # Category axes use zero-based category serial positions for numeric ranges.
+    # This makes the viewport an exact N-bar window with no market-closure gaps.
+    x_range = [view_start - 0.5, view_end + 0.5]
     for row in (1, 2, 3):
-        fig.update_xaxes(type="category", row=row, col=1)
+        fig.update_xaxes(
+            type="category",
+            range=x_range,
+            uirevision=x_revision,
+            row=row,
+            col=1,
+        )
 
     if len(x) > 0:
-        step = max(1, len(x) // 12)
-        tickvals = x[::step]
+        visible_count = max(1, view_end - view_start + 1)
+        step = max(1, visible_count // 12)
+        tick_positions = list(range(view_start, view_end + 1, step))
+        tickvals = [x[i] for i in tick_positions]
         ticktext = [
-            pd.Timestamp(v).strftime("%Y/%m/%d" if timeframe == "日足" else "%Y/%m")
-            for v in tickvals
+            pd.Timestamp(x[i]).strftime("%Y/%m/%d" if timeframe == "日足" else "%Y/%m")
+            for i in tick_positions
         ]
-        fig.update_xaxes(tickmode="array", tickvals=tickvals, ticktext=ticktext, row=3, col=1)
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            row=3,
+            col=1,
+        )
 
-    fig.update_yaxes(title_text="価格", row=1, col=1)
-    fig.update_yaxes(title_text="出来高", row=2, col=1)
-    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+    fig.update_yaxes(
+        title_text="価格",
+        range=list(price_range),
+        uirevision=y_revision,
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(
+        title_text="出来高",
+        range=list(volume_range),
+        uirevision=y_revision,
+        row=2,
+        col=1,
+    )
+    fig.update_yaxes(
+        title_text="RSI",
+        range=[0, 100],
+        uirevision=y_revision,
+        row=3,
+        col=1,
+    )
     return fig
 
 
@@ -228,6 +269,14 @@ if "chart_cursor" not in st.session_state:
     st.session_state.chart_cursor = None
 if "chart_cursor_signature" not in st.session_state:
     st.session_state.chart_cursor_signature = None
+if "chart_scale_signature" not in st.session_state:
+    st.session_state.chart_scale_signature = None
+if "chart_price_range" not in st.session_state:
+    st.session_state.chart_price_range = None
+if "chart_volume_range" not in st.session_state:
+    st.session_state.chart_volume_range = None
+if "chart_scale_reset_token" not in st.session_state:
+    st.session_state.chart_scale_reset_token = 0
 
 
 def weighted_average(old_qty: int, old_avg: float, add_qty: int, add_price: float) -> float:
@@ -447,21 +496,13 @@ with st.sidebar:
     ).strip().upper()
 
     today = dt.date.today()
-    default_start = today - dt.timedelta(days=365 * 3)
+    default_start = today - dt.timedelta(days=365 * 2)
     start = st.date_input("データ開始日", value=default_start)
     end = st.date_input("データ終了日", value=today)
 
     timeframe = st.radio("足種", ["日足", "週足", "月足"], horizontal=True)
 
     st.subheader("チャート")
-    chart_window_bars = st.number_input(
-        "表示本数",
-        min_value=10,
-        max_value=250,
-        value=60,
-        step=5,
-        help="順送り・逆送りではこの本数を固定したまま1足ずつ横へスライドします。",
-    )
     sma_list = st.multiselect(
         "移動平均",
         options=[5, 10, 20, 25, 50, 60, 75, 100, 200],
@@ -539,8 +580,35 @@ with tab_chart:
     if st.session_state.chart_cursor_signature != signature:
         st.session_state.chart_cursor_signature = signature
         st.session_state.chart_cursor = max(0, len(display_bars) - 1)
+        st.session_state.chart_scale_reset_token += 1
 
     max_cursor = max(0, len(display_bars) - 1)
+
+    # The period slider is the authoritative horizontal zoom for navigation.
+    # All available bars remain loaded in Plotly, so pinch/wheel zoom-out does
+    # not require another Yahoo Finance request.
+    slider_max = max(1, len(display_bars))
+    slider_min = min(10, slider_max)
+    slider_default = min(60, slider_max)
+    window_key = f"chart_window_bars::{ticker}::{timeframe}"
+    if window_key not in st.session_state:
+        st.session_state[window_key] = slider_default
+    else:
+        st.session_state[window_key] = max(
+            slider_min,
+            min(int(st.session_state[window_key]), slider_max),
+        )
+
+    chart_window_bars = st.slider(
+        "表示期間（足数）",
+        min_value=slider_min,
+        max_value=slider_max,
+        value=int(st.session_state[window_key]),
+        step=1,
+        key=window_key,
+        help="初期値は60足。2年分の読み込み済みデータから表示期間だけを変更します。",
+    )
+
     window_size = min(int(chart_window_bars), len(display_bars))
     min_cursor = max(0, window_size - 1)
 
@@ -577,6 +645,7 @@ with tab_chart:
     with nav3:
         if st.button("最新へ", disabled=cursor >= max_cursor, use_container_width=True):
             st.session_state.chart_cursor = max_cursor
+            st.session_state.chart_scale_reset_token += 1
             st.rerun()
 
     if sim["active"] and nav4 is not None:
@@ -587,7 +656,7 @@ with tab_chart:
                 type="primary",
                 use_container_width=True,
                 disabled=current_idx_for_chart >= len(prices) - 1,
-                help="未来を1取引日だけ開示し、チャート表示を同じ倍率のまま右へ進めます。",
+                help="未来を1取引日だけ開示し、現在の表示期間を保ったまま右へ進めます。",
             ):
                 next_idx = current_idx_for_chart + 1
                 next_date = prices.index[next_idx]
@@ -607,20 +676,40 @@ with tab_chart:
                 )
                 st.rerun()
 
+    window_start = max(0, cursor - window_size + 1)
+    window_view = display_bars.iloc[window_start : cursor + 1].copy()
+
+    # Recalculate the default vertical scale only when the instrument,
+    # timeframe or selected period changes (or when "latest" requests a reset).
+    scale_signature = (
+        ticker,
+        timeframe,
+        window_size,
+        st.session_state.chart_scale_reset_token,
+    )
+    if st.session_state.chart_scale_signature != scale_signature:
+        st.session_state.chart_scale_signature = scale_signature
+
+        low = float(window_view["Low"].min())
+        high = float(window_view["High"].max())
+        price_span = max(high - low, abs(high) * 0.01, 1e-6)
+        price_pad = price_span * 0.06
+        st.session_state.chart_price_range = (low - price_pad, high + price_pad)
+
+        vol_max = float(window_view["Volume"].max()) if len(window_view) else 0.0
+        st.session_state.chart_volume_range = (0.0, max(1.0, vol_max * 1.12))
+
     with nav5:
-        window_start = max(0, cursor - window_size + 1)
         shown_start = display_bars.index[window_start]
         shown_end = display_bars.index[cursor]
         st.write(
             f"表示: **{shown_start.date().isoformat()} ～ {shown_end.date().isoformat()}**　"
-            f"({window_size}足)"
+            f"({window_size}足 / 読込済み {len(display_bars)}足)"
         )
 
-    window_start = max(0, cursor - window_size + 1)
-    chart_data = display_bars.iloc[window_start : cursor + 1].copy()
-    if not chart_data.empty:
-        latest = chart_data.iloc[-1]
-        prev = chart_data.iloc[-2] if len(chart_data) >= 2 else latest
+    if not window_view.empty:
+        latest = display_bars.iloc[cursor]
+        prev = display_bars.iloc[cursor - 1] if cursor >= 1 else latest
         delta = latest["Close"] - prev["Close"]
         delta_pct = delta / prev["Close"] * 100 if prev["Close"] else 0.0
 
@@ -633,11 +722,16 @@ with tab_chart:
 
         st.plotly_chart(
             stock_chart(
-                chart_data,
+                display_bars,
                 ticker,
                 timeframe,
                 sma_list,
-                view_revision=f"{ticker}-{timeframe}-{window_size}",
+                view_start=window_start,
+                view_end=cursor,
+                price_range=st.session_state.chart_price_range,
+                volume_range=st.session_state.chart_volume_range,
+                x_revision=f"{ticker}-{timeframe}-{window_size}-{cursor}",
+                y_revision=f"{ticker}-{timeframe}-{window_size}-{st.session_state.chart_scale_reset_token}",
             ),
             use_container_width=True,
             key="main_stock_chart",
@@ -648,13 +742,19 @@ with tab_chart:
             },
         )
 
+        st.caption(
+            "チャートには現在利用可能な全履歴を読み込んでいます。"
+            " ピンチ/ホイールでズームアウトしても追加の株価取得は不要です。"
+            " 順送り・逆送り時の横方向の表示期間は上のスライダー値を維持します。"
+        )
+
         with st.expander("表示中の価格データ"):
-            view = chart_data.reset_index().rename(columns={"index": "Date"})
-            st.dataframe(view.tail(250), use_container_width=True, hide_index=True)
+            view = window_view.reset_index().rename(columns={"index": "Date"})
+            st.dataframe(view, use_container_width=True, hide_index=True)
             st.download_button(
-                "価格データCSVをダウンロード",
+                "表示中データCSVをダウンロード",
                 data=view.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{ticker}_{timeframe}_prices.csv",
+                file_name=f"{ticker}_{timeframe}_visible_prices.csv",
                 mime="text/csv",
             )
 
@@ -710,6 +810,7 @@ with tab_sim:
                 st.session_state.sim = new_sim
                 st.session_state.chart_cursor = None
                 st.session_state.chart_cursor_signature = None
+                st.session_state.chart_scale_reset_token += 1
                 st.rerun()
 
     else:
@@ -732,6 +833,7 @@ with tab_sim:
                 st.session_state.sim = empty_sim_state()
                 st.session_state.chart_cursor = None
                 st.session_state.chart_cursor_signature = None
+                st.session_state.chart_scale_reset_token += 1
                 st.rerun()
 
         spot_u, long_u, short_u, total_u = unrealized_pnl(sim, current_close)
