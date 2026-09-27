@@ -20,6 +20,10 @@ SMA_COLORS = [
     "#FFCC80",  # 薄いオレンジ
 ]
 
+UP_COLOR = "#E53935"  # 赤
+DOWN_COLOR = "#1E88E5"  # 青
+UNCHANGED_COLOR = "#9E9E9E"  # 灰色
+
 
 st.set_page_config(
     page_title="株価チャート・手動売買シミュレーター",
@@ -131,6 +135,15 @@ def add_indicators(df: pd.DataFrame, sma_list: list[int]) -> pd.DataFrame:
     return out
 
 
+def volume_colors(close: pd.Series) -> list[str]:
+    """Color each volume bar by its close compared with the previous bar."""
+    change = close.diff()
+    return [
+        UP_COLOR if value > 0 else DOWN_COLOR if value < 0 else UNCHANGED_COLOR
+        for value in change
+    ]
+
+
 def stock_chart(
     df: pd.DataFrame,
     ticker: str,
@@ -141,7 +154,8 @@ def stock_chart(
     price_range: tuple[float, float],
     volume_range: tuple[float, float],
     x_revision: str,
-    y_revision: str,
+    price_y_revision: str,
+    volume_y_revision: str,
 ) -> go.Figure:
     """
     Load the whole available history into Plotly, but show only view_start:view_end.
@@ -166,6 +180,14 @@ def stock_chart(
             low=df["Low"],
             close=df["Close"],
             name="株価",
+            increasing=dict(
+                line=dict(color=UP_COLOR),
+                fillcolor=UP_COLOR,
+            ),
+            decreasing=dict(
+                line=dict(color=DOWN_COLOR),
+                fillcolor=DOWN_COLOR,
+            ),
         ),
         row=1,
         col=1,
@@ -189,7 +211,16 @@ def stock_chart(
                 col=1,
             )
 
-    fig.add_trace(go.Bar(x=x, y=df["Volume"], name="出来高"), row=2, col=1)
+    fig.add_trace(
+        go.Bar(
+            x=x,
+            y=df["Volume"],
+            name="出来高",
+            marker_color=volume_colors(df["Close"]),
+        ),
+        row=2,
+        col=1,
+    )
     fig.add_trace(
         go.Scatter(x=x, y=df["RSI14"], mode="lines", name="RSI 14"),
         row=3,
@@ -240,21 +271,21 @@ def stock_chart(
     fig.update_yaxes(
         title_text="価格",
         range=list(price_range),
-        uirevision=y_revision,
+        uirevision=price_y_revision,
         row=1,
         col=1,
     )
     fig.update_yaxes(
         title_text="出来高",
         range=list(volume_range),
-        uirevision=y_revision,
+        uirevision=volume_y_revision,
         row=2,
         col=1,
     )
     fig.update_yaxes(
         title_text="RSI",
         range=[0, 100],
-        uirevision=y_revision,
+        uirevision=f"{x_revision}-rsi",
         row=3,
         col=1,
     )
@@ -299,6 +330,8 @@ if "chart_volume_range" not in st.session_state:
     st.session_state.chart_volume_range = None
 if "chart_scale_reset_token" not in st.session_state:
     st.session_state.chart_scale_reset_token = 0
+if "chart_scale_context" not in st.session_state:
+    st.session_state.chart_scale_context = None
 
 
 def weighted_average(old_qty: int, old_avg: float, add_qty: int, add_price: float) -> float:
@@ -530,6 +563,16 @@ with st.sidebar:
             options=[5, 10, 20, 25, 50, 60, 75, 100, 200],
             default=[5, 20, 60],
         )
+        auto_price_y = st.toggle(
+            "価格の縦軸を自動調整",
+            value=True,
+            help="ONにすると、表示中のローソク足が収まる範囲に縦軸を自動調整します。",
+        )
+        auto_volume_y = st.toggle(
+            "出来高の縦軸を自動調整",
+            value=True,
+            help="ONにすると、表示中の出来高に合わせて縦軸を自動調整します。",
+        )
 
         st.subheader("売買コスト")
         commission_pct = st.number_input(
@@ -752,23 +795,35 @@ with tab_chart:
     st.session_state[last_range_key] = selected_range
     st.session_state[shift_flag_key] = False
 
+    scale_context = (ticker, timeframe)
+    if st.session_state.chart_scale_context != scale_context:
+        st.session_state.chart_scale_context = scale_context
+        st.session_state.chart_price_range = None
+        st.session_state.chart_volume_range = None
+
     scale_signature = (
         ticker,
         timeframe,
         window_size,
         st.session_state.chart_scale_reset_token,
+        window_start if auto_price_y or auto_volume_y else None,
+        cursor if auto_price_y or auto_volume_y else None,
+        auto_price_y,
+        auto_volume_y,
     )
     if st.session_state.chart_scale_signature != scale_signature:
         st.session_state.chart_scale_signature = scale_signature
 
-        low = float(window_view["Low"].min())
-        high = float(window_view["High"].max())
-        price_span = max(high - low, abs(high) * 0.01, 1e-6)
-        price_pad = price_span * 0.06
-        st.session_state.chart_price_range = (low - price_pad, high + price_pad)
+        if auto_price_y or st.session_state.chart_price_range is None:
+            low = float(window_view["Low"].min())
+            high = float(window_view["High"].max())
+            price_span = max(high - low, abs(high) * 0.01, 1e-6)
+            price_pad = price_span * 0.06
+            st.session_state.chart_price_range = (low - price_pad, high + price_pad)
 
-        vol_max = float(window_view["Volume"].max()) if len(window_view) else 0.0
-        st.session_state.chart_volume_range = (0.0, max(1.0, vol_max * 1.12))
+        if auto_volume_y or st.session_state.chart_volume_range is None:
+            vol_max = float(window_view["Volume"].max()) if len(window_view) else 0.0
+            st.session_state.chart_volume_range = (0.0, max(1.0, vol_max * 1.12))
 
     shown_start = display_bars.index[window_start]
     shown_end = display_bars.index[cursor]
@@ -801,7 +856,16 @@ with tab_chart:
                 price_range=st.session_state.chart_price_range,
                 volume_range=st.session_state.chart_volume_range,
                 x_revision=f"{ticker}-{timeframe}-{window_start}-{cursor}",
-                y_revision=f"{ticker}-{timeframe}-{window_size}-{st.session_state.chart_scale_reset_token}",
+                price_y_revision=(
+                    f"{ticker}-{timeframe}-price-auto-{window_start}-{cursor}"
+                    if auto_price_y
+                    else f"{ticker}-{timeframe}-price-fixed"
+                ),
+                volume_y_revision=(
+                    f"{ticker}-{timeframe}-volume-auto-{window_start}-{cursor}"
+                    if auto_volume_y
+                    else f"{ticker}-{timeframe}-volume-fixed"
+                ),
             ),
             use_container_width=True,
             key="main_stock_chart",
@@ -814,7 +878,7 @@ with tab_chart:
 
         st.caption(
             "左右2つのハンドルで表示期間を自由に調整できます。"
-            " 順送り・逆送りでは選択幅と縦倍率を保ったまま1足ずつ横へスライドします。"
+            " 縦軸自動調整がONの場合は表示範囲に追従し、OFFの場合は現在の倍率を保ちます。"
             " チャート上の1本指ドラッグはパン（移動）が既定です。"
         )
 
@@ -1035,3 +1099,4 @@ st.caption(
     "注意: Yahoo Finance/yfinanceのデータは遅延・欠損・修正があり得ます。"
     " 本アプリは学習・検証用で、投資助言や証券会社への注文機能ではありません。"
 )
+
