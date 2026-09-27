@@ -511,7 +511,6 @@ st.caption("価格データ: Yahoo Finance（yfinance）。実注文は行わな
 
 with st.sidebar:
     with st.expander("基本設定", expanded=True):
-        st.header("基本設定")
         ticker = st.text_input(
             "銘柄コード",
             value="7203.T",
