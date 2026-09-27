@@ -1,0 +1,19 @@
+{
+  "files": [
+    "streamlit_app.py",
+    "requirements.txt",
+    ".streamlit/config.toml",
+    "run_windows.bat",
+    "README_IPAD.md"
+  ],
+  "default_ticker": "7203.T",
+  "features": [
+    "Candlestick chart",
+    "Volume",
+    "SMA",
+    "RSI",
+    "MA crossover backtest",
+    "Manual round-trip simulation",
+    "CSV download"
+  ]
+}
