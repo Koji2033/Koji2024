@@ -9,11 +9,18 @@
   "default_ticker": "7203.T",
   "features": [
     "Candlestick chart",
+    "Daily weekly monthly timeframe",
+    "One-bar chart navigation",
+    "No trading-day gaps on daily chart",
     "Volume",
     "SMA",
     "RSI",
-    "MA crossover backtest",
-    "Manual round-trip simulation",
+    "Day-by-day manual trading simulation",
+    "Future-data lockout during simulation",
+    "Spot and simplified margin trading",
+    "Buy and sell",
+    "Next-day market-on-open market-on-close and limit orders",
+    "Realized and unrealized PnL",
     "CSV download"
   ]
 }
