@@ -681,18 +681,20 @@ with tab_chart:
                 next_bars = aggregate_prices(next_visible, timeframe)
                 new_bar_count = len(next_bars)
                 added_bars = max(0, new_bar_count - old_bar_count)
+                next_bar_dates = [d.date() for d in next_bars.index]
 
-                if added_bars > 0:
-                    next_bar_dates = [d.date() for d in next_bars.index]
-                    new_end_idx = min(
-                        len(next_bar_dates) - 1,
-                        saved_end_idx + added_bars,
-                    )
-                    new_start_idx = max(0, new_end_idx - saved_width + 1)
-                    st.session_state[range_key] = (
-                        next_bar_dates[new_start_idx],
-                        next_bar_dates[new_end_idx],
-                    )
+                # Keep the selected width and translate the whole window.
+                # Even when weekly/monthly bar count does not increase, the
+                # latest aggregate bar's label date changes as a new day is revealed.
+                new_end_idx = min(
+                    len(next_bar_dates) - 1,
+                    saved_end_idx + added_bars,
+                )
+                new_start_idx = max(0, new_end_idx - saved_width + 1)
+                st.session_state[range_key] = (
+                    next_bar_dates[new_start_idx],
+                    next_bar_dates[new_end_idx],
+                )
                 st.session_state[shift_flag_key] = True
                 st.rerun()
 
