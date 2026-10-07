@@ -1,7 +1,13 @@
 import datetime as dt
+import io
+import random
+import re
+from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -85,6 +91,73 @@ def load_prices(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
         threads=False,
     )
     return normalize_ohlcv(raw, ticker)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_tse_universe() -> list[dict]:
+    """Use JPX's current full listing, including ETFs and REITs."""
+    page_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
+    response = requests.get(page_url, timeout=20)
+    response.raise_for_status()
+    links = re.findall(r'href=[\"\x27]([^\"\x27]+data_j\.xlsx?)[\"\x27]', response.text)
+    if not links:
+        raise ValueError("JPXの銘柄一覧ファイルが見つかりません。時間を置いて再試行してください。")
+    file_url = urljoin(page_url, links[0])
+    if urlparse(file_url).hostname != "www.jpx.co.jp":
+        raise ValueError("JPXの銘柄一覧URLを確認できませんでした。")
+    response = requests.get(file_url, timeout=30)
+    response.raise_for_status()
+    listing = pd.read_excel(io.BytesIO(response.content), dtype=str)
+    listing.columns = listing.columns.str.strip()
+    records = []
+    for _, row in listing.iterrows():
+        code = str(row["コード"]).strip().upper()
+        if re.fullmatch(r"[0-9][0-9A-Z]{3}", code):
+            records.append({"ticker": f"{code}.T", "name": str(row["銘柄名"]),
+                            "market": str(row["市場・商品区分"])})
+    if not records:
+        raise ValueError("JPXの銘柄一覧が空でした。")
+    return list({record["ticker"]: record for record in records}.values())
+
+
+def training_months(today: dt.date) -> list[dt.date]:
+    """Calendar month starts strictly within the four-to-one-year window."""
+    earliest = pd.Timestamp(today) - pd.DateOffset(years=4)
+    latest = pd.Timestamp(today) - pd.DateOffset(years=1)
+    return [date.date() for date in pd.date_range(earliest, latest, freq="MS")]
+
+
+def propose_training(previous: dict | None = None) -> dict:
+    today = dt.datetime.now(ZoneInfo("Asia/Tokyo")).date()
+    universe = load_tse_universe()
+    if previous:
+        universe = [item for item in universe if item["ticker"] != previous["ticker"]]
+    months = training_months(today)
+    if previous:
+        months = [date for date in months if date != previous["start_date"]]
+    rng = random.SystemRandom()
+    # Bound requests so missing Yahoo history cannot leave the app spinning forever.
+    for item in rng.sample(universe, min(12, len(universe))):
+        month = rng.choice(months)
+        history_start = month - dt.timedelta(days=730)
+        try:
+            prices = load_prices(item["ticker"], history_start, today)
+        except Exception:
+            continue
+        if prices.empty:
+            continue
+        candidates = np.where(prices.index.date >= month)[0]
+        if not len(candidates):
+            continue
+        idx = int(candidates[0])
+        actual = prices.index[idx].date()
+        # Skip newly listed securities lacking history for the proposed month.
+        if (actual.year, actual.month) != (month.year, month.month) or idx == len(prices) - 1:
+            continue
+        return {**item, "start_date": month, "actual_date": actual,
+                "history_start": history_start, "end_date": today,
+                "prices": prices, "start_idx": idx}
+    raise ValueError("条件に合う株価データを取得できませんでした。もう一度候補を抽選してください。")
 
 
 def aggregate_prices(daily: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -543,17 +616,70 @@ st.title("📈 株価チャート・手動売買シミュレーター")
 st.caption("価格データ: Yahoo Finance（yfinance）。実注文は行わない学習・検証用アプリです。")
 
 with st.sidebar:
+    st.subheader("ランダムトレーニング")
+    st.caption("東証の全上場銘柄から、4～1年前の月初をランダムに提案します。")
+    if st.button("🎲 銘柄と開始日を提案", use_container_width=True):
+        with st.spinner("銘柄と開始日のデータを確認しています…"):
+            try:
+                st.session_state.training_proposal = propose_training()
+            except Exception as e:
+                st.error(f"候補の取得に失敗しました: {e}")
+
+    proposal = st.session_state.get("training_proposal")
+    if proposal:
+        st.write(f"**{proposal['name']}（{proposal['ticker']}）**")
+        st.write(f"開始月: {proposal['start_date']:%Y/%m/%d}")
+        st.caption(f"開始取引日: {proposal['actual_date']:%Y/%m/%d} / {proposal['market']}")
+        training_cash = st.number_input(
+            "トレーニング初期資金", min_value=10_000.0,
+            value=float(st.session_state.get("sim_initial_cash", 1_000_000.0)),
+            step=100_000.0, format="%.0f", key="training_initial_cash",
+        )
+        if st.session_state.sim["active"]:
+            st.caption("OKを押すと、現在のシミュレーションを終了し、新しい練習を開始します。")
+        if st.button("OK・この条件で開始", type="primary", use_container_width=True):
+            new_sim = empty_sim_state()
+            new_sim.update({"active": True, "ticker": proposal["ticker"],
+                            "current_idx": proposal["start_idx"], "start_idx": proposal["start_idx"],
+                            "initial_cash": float(training_cash), "cash": float(training_cash)})
+            st.session_state.sim = new_sim
+            st.session_state.training_prices = proposal
+            st.session_state.ticker_input = proposal["ticker"]
+            st.session_state.data_start_input = proposal["history_start"]
+            st.session_state.data_end_input = proposal["end_date"]
+            st.session_state.sim_start_date = proposal["actual_date"]
+            st.session_state.sim_initial_cash = float(training_cash)
+            for key in list(st.session_state):
+                if key.startswith(("chart_range::", "chart_range_last::", "chart_range_shifted::")):
+                    del st.session_state[key]
+            st.session_state.chart_price_range = None
+            st.session_state.chart_volume_range = None
+            st.session_state.chart_scale_reset_token += 1
+            del st.session_state.training_proposal
+            st.rerun()
+        if st.button("別の銘柄と開始日を提案", use_container_width=True):
+            with st.spinner("別の候補を確認しています…"):
+                try:
+                    st.session_state.training_proposal = propose_training(proposal)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"候補の取得に失敗しました: {e}")
+        if st.button("キャンセル", use_container_width=True):
+            del st.session_state.training_proposal
+            st.rerun()
+
     with st.expander("基本設定", expanded=True):
         ticker = st.text_input(
             "銘柄コード",
             value="7203.T",
+            key="ticker_input",
             help="日本株は例: 7203.T、米国株は例: AAPL",
         ).strip().upper()
 
         today = dt.date.today()
         default_start = today - dt.timedelta(days=365 * 2)
-        start = st.date_input("データ開始日", value=default_start)
-        end = st.date_input("データ終了日", value=today)
+        start = st.date_input("データ開始日", value=default_start, key="data_start_input")
+        end = st.date_input("データ終了日", value=today, key="data_end_input")
 
         timeframe = st.radio("足種", ["日足", "週足", "月足"], horizontal=True)
 
@@ -595,6 +721,7 @@ with st.sidebar:
 
         if st.button("価格データを再取得", use_container_width=True):
             load_prices.clear()
+            st.session_state.pop("training_prices", None)
             st.rerun()
 
 if not ticker:
@@ -606,7 +733,13 @@ if start >= end:
 
 with st.spinner("価格データを取得しています…"):
     try:
-        prices = load_prices(ticker, start, end)
+        training = st.session_state.get("training_prices")
+        if training and (ticker, start, end) == (
+            training["ticker"], training["history_start"], training["end_date"]
+        ):
+            prices = training["prices"].copy()
+        else:
+            prices = load_prices(ticker, start, end)
     except Exception as e:
         st.error(f"価格データ取得に失敗しました: {e}")
         st.stop()
@@ -1099,4 +1232,3 @@ st.caption(
     "注意: Yahoo Finance/yfinanceのデータは遅延・欠損・修正があり得ます。"
     " 本アプリは学習・検証用で、投資助言や証券会社への注文機能ではありません。"
 )
-
